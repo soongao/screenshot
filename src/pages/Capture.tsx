@@ -110,6 +110,11 @@ type CaptureAppSettings = {
   closeAfterCopy: boolean
   closeAfterSave: boolean
   closeAfterPin: boolean
+  annotationColor: string
+  annotationStrokeWidth: number
+  annotationFontSize: number
+  toolbarOpacity: number
+  toolbarScale: number
   ocrLanguages: 'eng' | 'chi_sim' | 'eng+chi_sim'
   pinWindowShadow: boolean
   pinWindowOpacity: number
@@ -147,6 +152,11 @@ const DEFAULT_CAPTURE_SETTINGS: CaptureAppSettings = {
   closeAfterCopy: true,
   closeAfterSave: false,
   closeAfterPin: true,
+  annotationColor: '#ff3b30',
+  annotationStrokeWidth: 4,
+  annotationFontSize: 20,
+  toolbarOpacity: 0.94,
+  toolbarScale: 1,
   ocrLanguages: 'eng+chi_sim',
   pinWindowShadow: true,
   pinWindowOpacity: 1,
@@ -176,6 +186,8 @@ export default function Capture() {
   const [translationSourceLang, setTranslationSourceLang] = useState<'auto' | 'zh' | 'en'>(initialSourceLang)
   const [translationTarget, setTranslationTarget] = useState<'zh' | 'en'>(initialTargetLang)
   const stageRef = useRef<KonvaStage | null>(null)
+  const exportOverlayGroupRef = useRef<any>(null)
+  const exportMagnifierGroupRef = useRef<any>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const captureIntent = searchParams.get('intent') === 'translate'
     ? 'translate'
@@ -528,10 +540,18 @@ export default function Capture() {
           closeAfterCopy: settings.closeAfterCopy,
           closeAfterSave: settings.closeAfterSave,
           closeAfterPin: settings.closeAfterPin,
+          annotationColor: settings.annotationColor,
+          annotationStrokeWidth: settings.annotationStrokeWidth,
+          annotationFontSize: settings.annotationFontSize,
+          toolbarOpacity: settings.toolbarOpacity,
+          toolbarScale: settings.toolbarScale,
           ocrLanguages: settings.ocrLanguages,
           pinWindowShadow: settings.pinWindowShadow,
           pinWindowOpacity: settings.pinWindowOpacity,
         })
+        setColor(settings.annotationColor)
+        setStrokeWidth(settings.annotationStrokeWidth)
+        setFontSize(settings.annotationFontSize)
         const sources = await window.electronAPI.getDesktopSources()
         await loadWindowCandidates(displayId)
         if (sources.length === 0) {
@@ -1166,30 +1186,29 @@ export default function Capture() {
     }
   }
 
-  const [isExporting, setIsExporting] = useState(false)
-
   const exportSelection = useCallback(async () => {
     if (!selection || selection.width <= 0 || selection.height <= 0 || !stageRef.current) return null
-    setIsExporting(true)
+    const nodes = [exportOverlayGroupRef.current, exportMagnifierGroupRef.current].filter(Boolean)
+    const previousVisibleStates = nodes.map((node) => node.visible())
 
     try {
-      await new Promise(resolve => setTimeout(resolve, 50))
-
+      nodes.forEach((node) => node.visible(false))
+      stageRef.current.batchDraw()
       return stageRef.current.toDataURL({
         x: selection.x,
         y: selection.y,
         width: selection.width,
         height: selection.height,
-        pixelRatio: 1
+        pixelRatio: 1,
       })
     } finally {
-      setIsExporting(false)
+      nodes.forEach((node, index) => node.visible(previousVisibleStates[index]))
+      stageRef.current.batchDraw()
     }
   }, [selection])
 
   const shouldShowMagnifier = Boolean(
-    !isExporting
-    && pointerPos
+    pointerPos
     && (!selection || isSelecting || Boolean(selectionResizeInteraction))
     && !toolbarDrag
     && !editingTextId,
@@ -1213,7 +1232,7 @@ export default function Capture() {
     }
   }, [])
 
-  const recordHistory = useCallback(async (dataURL: string, action: 'copy' | 'save' | 'pin', format: 'png' | 'jpg') => {
+  const recordHistory = useCallback(async (dataURL: string, action: 'copy' | 'save' | 'pin' | 'confirm', format: 'png' | 'jpg') => {
     const result = await window.electronAPI.recordCaptureHistory({ dataURL, action, format })
     if (result.status === 'error') {
       console.warn('Failed to record capture history', result.message)
@@ -1561,25 +1580,15 @@ export default function Capture() {
     })
   }
 
-  const resetSelectionForReselect = () => {
-    setSelection(null)
-    setStartPoint(null)
-    setIsSelecting(false)
-    setIsDrawing(false)
-    setCurrentShapeId(null)
-    setEditingTextId(null)
-    setSelectedTextId(null)
-    setSelectedShapeId(null)
-    setResizingTextId(null)
-    setTextInteraction(null)
-    setShapeInteraction(null)
-    setSelectionInteraction(null)
-    setSelectionResizeInteraction(null)
-    setToolbarPosition(null)
-    setToolbarDrag(null)
-    setActiveTool(null)
-    clear()
-  }
+  const handleCancelCapture = useCallback(() => {
+    window.electronAPI.closeCapture()
+  }, [])
+
+  useEffect(() => {
+    window.electronAPI.onCancelCaptureRequest(() => {
+      handleCancelCapture()
+    })
+  }, [handleCancelCapture])
 
   const handleSelectionMoveStart = (event: React.MouseEvent<HTMLDivElement>) => {
     if (consumeSuppressedCanvasPointer()) {
@@ -1681,8 +1690,32 @@ export default function Capture() {
     })
   }
 
-  const handleCloseCapture = () => {
-    window.electronAPI.closeCapture()
+  const handleCloseCapture = async () => {
+    if (isActionPending) {
+      return
+    }
+
+    if (!selection || selection.width <= 0 || selection.height <= 0) {
+      window.electronAPI.closeCapture()
+      return
+    }
+
+    setIsActionPending(true)
+    try {
+      const dataURL = await exportSelection()
+      if (!dataURL) {
+        showFeedback('error', '当前没有可确认的有效选区')
+        return
+      }
+
+      await recordHistory(dataURL, 'confirm', 'png')
+      window.electronAPI.closeCapture()
+    } catch (error) {
+      console.error('Failed to confirm capture', error)
+      showFeedback('error', '确认截图失败，请重试')
+    } finally {
+      setIsActionPending(false)
+    }
   }
 
   const stopToolbarPointerEvent = (event: React.MouseEvent<HTMLElement>) => {
@@ -1709,6 +1742,28 @@ export default function Capture() {
     toggleTool('text')
   }
 
+  const toolButtonClass = (tool: ToolType) => {
+    const isActive = visibleStyleTool === tool
+    return `rounded-xl border px-2.5 py-2 transition ${
+      isActive
+        ? 'border-blue-200 bg-blue-50 text-blue-600 shadow-sm'
+        : 'border-transparent bg-transparent text-zinc-600 hover:border-zinc-200 hover:bg-zinc-50 hover:text-zinc-900'
+    } disabled:cursor-not-allowed disabled:opacity-50`
+  }
+
+  const actionIconButtonClass = (tone: 'neutral' | 'blue' | 'green' | 'amber' | 'purple' | 'red') => {
+    const toneMap = {
+      neutral: 'text-zinc-600 hover:border-zinc-200 hover:bg-zinc-50 hover:text-zinc-900',
+      blue: 'text-blue-600 hover:border-blue-200 hover:bg-blue-50',
+      green: 'text-emerald-600 hover:border-emerald-200 hover:bg-emerald-50',
+      amber: 'text-amber-600 hover:border-amber-200 hover:bg-amber-50',
+      purple: 'text-violet-600 hover:border-violet-200 hover:bg-violet-50',
+      red: 'text-red-600 hover:border-red-200 hover:bg-red-50',
+    } as const
+
+    return `rounded-xl border border-transparent px-2.5 py-2 transition ${toneMap[tone]} disabled:cursor-not-allowed disabled:opacity-50`
+  }
+
   const renderToolConfigPanel = (tool: ToolType) => {
     if (visibleStyleTool !== tool) {
       return null
@@ -1716,15 +1771,18 @@ export default function Capture() {
 
     return (
       <div
-        className="absolute left-1/2 top-full z-10 mt-2 flex min-w-[220px] -translate-x-1/2 flex-col gap-2 rounded-xl border border-zinc-200 bg-white p-3 text-xs text-zinc-700 shadow-xl"
+        className="absolute left-1/2 top-full z-10 mt-3 flex min-w-[240px] -translate-x-1/2 flex-col gap-3 rounded-2xl border border-white/80 bg-white/95 p-4 text-xs text-zinc-700 shadow-[0_20px_50px_rgba(15,23,42,0.16)] backdrop-blur"
         onMouseDown={stopToolbarPointerEvent}
         onMouseUp={stopToolbarPointerEvent}
         onClick={stopToolbarPointerEvent}
       >
-        <div className="font-medium text-zinc-900">{TOOL_LABELS[tool]}设置</div>
+        <div className="flex items-center justify-between gap-3">
+          <div className="font-medium text-zinc-900">{TOOL_LABELS[tool]}设置</div>
+          <div className="rounded-full bg-zinc-100 px-2 py-1 text-[10px] uppercase tracking-[0.14em] text-zinc-500">{TOOL_LABELS[tool]}</div>
+        </div>
 
         {shouldShowColorOptions && (
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
             <span className="w-8 shrink-0 text-zinc-500">颜色</span>
             <div className="flex flex-1 items-center gap-2">
               <div className="flex flex-wrap gap-1">
@@ -1735,7 +1793,7 @@ export default function Capture() {
                       key={presetColor}
                       type="button"
                       aria-label={`选择颜色 ${presetColor}`}
-                      className={`h-6 w-6 rounded-full border transition ${isActive ? 'scale-110 border-zinc-900 shadow-sm' : 'border-zinc-200 hover:border-zinc-400'}`}
+                      className={`h-6 w-6 rounded-full border transition ${isActive ? 'scale-110 border-zinc-900 shadow-sm ring-2 ring-zinc-200' : 'border-zinc-200 hover:border-zinc-400'}`}
                       style={{ backgroundColor: presetColor }}
                       onMouseDown={stopToolbarPointerEvent}
                       onClick={() => handleColorChange(presetColor)}
@@ -1747,7 +1805,7 @@ export default function Capture() {
                 type="color"
                 value={color}
                 disabled={isActionPending}
-                className="h-7 w-9 cursor-pointer rounded border border-zinc-200 bg-transparent p-0"
+                className="h-8 w-10 cursor-pointer rounded-lg border border-zinc-200 bg-transparent p-1"
                 onMouseDown={stopToolbarPointerEvent}
                 onClick={stopToolbarPointerEvent}
                 onChange={(event) => handleColorChange(event.target.value)}
@@ -1757,14 +1815,14 @@ export default function Capture() {
         )}
 
         {shouldShowStrokeWidthOptions && (
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
             <span className="w-8 shrink-0 text-zinc-500">粗细</span>
             <div className="flex flex-wrap gap-1">
               {[2, 4, 6, 8, 12].map((size) => (
                 <button
                   key={size}
                   type="button"
-                  className={`rounded-md border px-2 py-1 ${strokeWidth === size ? 'border-zinc-900 bg-zinc-900 text-white' : 'border-zinc-200 hover:border-zinc-400 hover:bg-zinc-50'}`}
+                  className={`rounded-lg border px-2.5 py-1.5 ${strokeWidth === size ? 'border-zinc-900 bg-zinc-900 text-white shadow-sm' : 'border-zinc-200 bg-white hover:border-zinc-400 hover:bg-zinc-50'}`}
                   onMouseDown={stopToolbarPointerEvent}
                   onClick={() => handleStrokeWidthChange(size)}
                 >
@@ -1776,14 +1834,14 @@ export default function Capture() {
         )}
 
         {shouldShowFontSizeOptions && (
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
             <span className="w-8 shrink-0 text-zinc-500">字号</span>
             <div className="flex flex-wrap gap-1">
               {[14, 18, 20, 24, 28, 32].map((size) => (
                 <button
                   key={size}
                   type="button"
-                  className={`rounded-md border px-2 py-1 ${fontSize === size ? 'border-zinc-900 bg-zinc-900 text-white' : 'border-zinc-200 hover:border-zinc-400 hover:bg-zinc-50'}`}
+                  className={`rounded-lg border px-2.5 py-1.5 ${fontSize === size ? 'border-zinc-900 bg-zinc-900 text-white shadow-sm' : 'border-zinc-200 bg-white hover:border-zinc-400 hover:bg-zinc-50'}`}
                   onMouseDown={stopToolbarPointerEvent}
                   onClick={() => handleFontSizeChange(size)}
                 >
@@ -1829,9 +1887,8 @@ export default function Capture() {
       >
         <Layer>
           <KonvaImage image={bgImage} width={window.innerWidth} height={window.innerHeight} />
-          
-          {/* Dark Overlay */}
-          {!isExporting && (
+          <Group ref={exportOverlayGroupRef}>
+            {/* Dark Overlay */}
             <Rect
               x={0}
               y={0}
@@ -1840,19 +1897,71 @@ export default function Capture() {
               fill="rgba(0,0,0,0.4)"
               globalCompositeOperation="source-over"
             />
-          )}
-          
-          {/* Clear Hole for Selection */}
-          {!isExporting && selection && (
-            <Rect
-              x={selection.x}
-              y={selection.y}
-              width={selection.width}
-              height={selection.height}
-              fill="black"
-              globalCompositeOperation="destination-out"
-            />
-          )}
+            
+            {/* Clear Hole for Selection */}
+            {selection && (
+              <Rect
+                x={selection.x}
+                y={selection.y}
+                width={selection.width}
+                height={selection.height}
+                fill="black"
+                globalCompositeOperation="destination-out"
+              />
+            )}
+
+            {!selection && hoveredWindow && (
+              <Group>
+                <Rect
+                  x={hoveredWindow.bounds.x}
+                  y={hoveredWindow.bounds.y}
+                  width={hoveredWindow.bounds.width}
+                  height={hoveredWindow.bounds.height}
+                  fill="rgba(24, 144, 255, 0.16)"
+                  stroke="#1890ff"
+                  strokeWidth={2.5}
+                  dash={[6, 4]}
+                />
+                <Rect
+                  x={hoveredWindow.bounds.x}
+                  y={hoveredWindow.bounds.y}
+                  width={hoveredWindow.bounds.width}
+                  height={hoveredWindow.bounds.height}
+                  stroke="rgba(255,255,255,0.9)"
+                  strokeWidth={1}
+                />
+                <Rect
+                  x={hoveredWindow.bounds.x}
+                  y={Math.max(8, hoveredWindow.bounds.y - 30)}
+                  width={Math.min(280, Math.max(120, hoveredWindow.bounds.width))}
+                  height={24}
+                  fill="rgba(24, 144, 255, 0.95)"
+                  cornerRadius={6}
+                />
+                <Text
+                  x={hoveredWindow.bounds.x + 8}
+                  y={Math.max(12, hoveredWindow.bounds.y - 26)}
+                  text={hoveredWindow.name ? `${hoveredWindow.ownerName} · ${hoveredWindow.name}` : hoveredWindow.ownerName}
+                  fontSize={12}
+                  fill="#ffffff"
+                  width={Math.min(264, Math.max(104, hoveredWindow.bounds.width - 16))}
+                  ellipsis
+                />
+              </Group>
+            )}
+
+            {/* Selection Border */}
+            {selection && (
+              <Rect
+                x={selection.x}
+                y={selection.y}
+                width={selection.width}
+                height={selection.height}
+                stroke="#1890ff"
+                strokeWidth={2}
+              />
+            )}
+          </Group>
           
           {/* Shapes (only render inside selection) */}
           {selection && selection.width > 0 && (
@@ -2077,61 +2186,10 @@ export default function Capture() {
             </Group>
           )}
 
-          {!isExporting && !selection && hoveredWindow && (
-            <Group>
-              <Rect
-                x={hoveredWindow.bounds.x}
-                y={hoveredWindow.bounds.y}
-                width={hoveredWindow.bounds.width}
-                height={hoveredWindow.bounds.height}
-                fill="rgba(24, 144, 255, 0.16)"
-                stroke="#1890ff"
-                strokeWidth={2.5}
-                dash={[6, 4]}
-              />
-              <Rect
-                x={hoveredWindow.bounds.x}
-                y={hoveredWindow.bounds.y}
-                width={hoveredWindow.bounds.width}
-                height={hoveredWindow.bounds.height}
-                stroke="rgba(255,255,255,0.9)"
-                strokeWidth={1}
-              />
-              <Rect
-                x={hoveredWindow.bounds.x}
-                y={Math.max(8, hoveredWindow.bounds.y - 30)}
-                width={Math.min(280, Math.max(120, hoveredWindow.bounds.width))}
-                height={24}
-                fill="rgba(24, 144, 255, 0.95)"
-                cornerRadius={6}
-              />
-              <Text
-                x={hoveredWindow.bounds.x + 8}
-                y={Math.max(12, hoveredWindow.bounds.y - 26)}
-                text={hoveredWindow.name ? `${hoveredWindow.ownerName} · ${hoveredWindow.name}` : hoveredWindow.ownerName}
-                fontSize={12}
-                fill="#ffffff"
-                width={Math.min(264, Math.max(104, hoveredWindow.bounds.width - 16))}
-                ellipsis
-              />
-            </Group>
-          )}
-
-          {/* Selection Border */}
-          {!isExporting && selection && (
-            <Rect
-              x={selection.x}
-              y={selection.y}
-              width={selection.width}
-              height={selection.height}
-              stroke="#1890ff"
-              strokeWidth={2}
-            />
-          )}
-
           {/* Magnifier */}
           {shouldShowMagnifier && pointerPos && (
             <Group
+              ref={exportMagnifierGroupRef}
               x={magnifierLeft + 66}
               y={magnifierTop + 66}
               clipFunc={(ctx) => {
@@ -2155,14 +2213,14 @@ export default function Capture() {
 
       {feedback && (
         <div
-          className={`absolute left-1/2 top-20 z-50 flex items-center gap-3 -translate-x-1/2 rounded-md px-4 py-2 text-sm shadow-lg ${
+          className={`absolute left-1/2 top-20 z-50 flex items-center gap-3 -translate-x-1/2 rounded-2xl border px-4 py-2.5 text-sm shadow-[0_18px_45px_rgba(15,23,42,0.22)] backdrop-blur ${
             feedback.tone === 'success'
-              ? 'bg-zinc-900 text-white'
+              ? 'border-emerald-500/20 bg-emerald-600/90 text-white'
               : feedback.tone === 'actionable'
-                ? 'bg-blue-600 text-white'
+                ? 'border-blue-500/20 bg-blue-600/90 text-white'
               : feedback.tone === 'info'
-                ? 'bg-zinc-700 text-white'
-                : 'bg-red-600 text-white'
+                ? 'border-zinc-500/20 bg-zinc-800/90 text-white'
+                : 'border-red-500/20 bg-red-600/90 text-white'
           }`}
         >
           <span>{feedback.message}</span>
@@ -2533,57 +2591,60 @@ export default function Capture() {
       {/* Toolbar */}
       {selection && selection.width > 0 && !isSelecting && !isDrawing && (
         <div
-          className="absolute z-50 flex max-w-[min(92vw,980px)] flex-wrap select-none items-center gap-2 rounded-md bg-white p-2 text-zinc-700 shadow-lg pointer-events-auto"
+          className="absolute z-50 flex max-w-[min(94vw,1080px)] flex-wrap select-none items-center gap-2 rounded-[22px] border border-white/80 bg-white/92 p-2.5 text-zinc-700 shadow-[0_24px_70px_rgba(15,23,42,0.16)] backdrop-blur pointer-events-auto"
           style={{
             left: resolvedToolbarLeft,
             top: resolvedToolbarTop,
+            opacity: appSettings.toolbarOpacity,
+            transform: `scale(${appSettings.toolbarScale})`,
+            transformOrigin: 'top left',
           }}
           onMouseDown={stopToolbarPointerEvent}
           onMouseUp={stopToolbarPointerEvent}
           onClick={stopToolbarPointerEvent}
         >
           <div
-            className="flex cursor-move items-center gap-1 rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs text-zinc-500 hover:border-zinc-300 hover:bg-zinc-100"
+            aria-label="拖动工具栏"
+            className="flex cursor-move items-center rounded-xl border border-zinc-200 bg-zinc-50 px-2.5 py-2 text-xs font-medium text-zinc-500 hover:border-zinc-300 hover:bg-zinc-100"
             onMouseDown={handleToolbarDragStart}
           >
             <GripHorizontal size={14} />
-            拖动
           </div>
-          <div className="h-5 w-px bg-zinc-300" />
+          <div className="h-6 w-px bg-zinc-200" />
           <div className="relative">
-            <button type="button" className={`rounded p-1.5 hover:bg-zinc-100 ${visibleStyleTool === 'rect' ? 'bg-zinc-200' : ''}`} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('rect')}><Square size={18} /></button>
+            <button type="button" className={toolButtonClass('rect')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('rect')}><Square size={18} /></button>
             {renderToolConfigPanel('rect')}
           </div>
           <div className="relative">
-            <button type="button" className={`rounded p-1.5 hover:bg-zinc-100 ${visibleStyleTool === 'circle' ? 'bg-zinc-200' : ''}`} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('circle')}><CircleIcon size={18} /></button>
+            <button type="button" className={toolButtonClass('circle')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('circle')}><CircleIcon size={18} /></button>
             {renderToolConfigPanel('circle')}
           </div>
           <div className="relative">
-            <button type="button" className={`rounded p-1.5 hover:bg-zinc-100 ${visibleStyleTool === 'line' ? 'bg-zinc-200' : ''}`} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('line')}><Minus size={18} /></button>
+            <button type="button" className={toolButtonClass('line')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('line')}><Minus size={18} /></button>
             {renderToolConfigPanel('line')}
           </div>
           <div className="relative">
-            <button type="button" className={`rounded p-1.5 hover:bg-zinc-100 ${visibleStyleTool === 'arrow' ? 'bg-zinc-200' : ''}`} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('arrow')}><ArrowUpRight size={18} /></button>
+            <button type="button" className={toolButtonClass('arrow')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('arrow')}><ArrowUpRight size={18} /></button>
             {renderToolConfigPanel('arrow')}
           </div>
           <div className="relative">
-            <button type="button" className={`rounded p-1.5 hover:bg-zinc-100 ${visibleStyleTool === 'pen' ? 'bg-zinc-200' : ''}`} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('pen')}><Pen size={18} /></button>
+            <button type="button" className={toolButtonClass('pen')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('pen')}><Pen size={18} /></button>
             {renderToolConfigPanel('pen')}
           </div>
           <div className="relative">
-            <button type="button" className={`rounded p-1.5 hover:bg-zinc-100 ${visibleStyleTool === 'text' ? 'bg-zinc-200' : ''}`} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={handleTextToolClick}><Type size={18} /></button>
+            <button type="button" className={toolButtonClass('text')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={handleTextToolClick}><Type size={18} /></button>
             {renderToolConfigPanel('text')}
           </div>
           <div className="relative">
-            <button type="button" className={`rounded p-1.5 hover:bg-zinc-100 ${visibleStyleTool === 'mosaic' ? 'bg-zinc-200' : ''}`} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('mosaic')}><BoxSelect size={18} /></button>
+            <button type="button" className={toolButtonClass('mosaic')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => toggleTool('mosaic')}><BoxSelect size={18} /></button>
             {renderToolConfigPanel('mosaic')}
           </div>
           {selectedAnnotatingShape && !editingTextId && (
             <>
-              <div className="w-px h-5 bg-zinc-300 mx-1" />
+              <div className="mx-1 h-6 w-px bg-zinc-200" />
               <button
                 type="button"
-                className="rounded-md border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50"
+                className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs font-medium text-zinc-700 hover:border-zinc-300 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={isActionPending}
                 onMouseDown={stopToolbarPointerEvent}
                 onClick={handleDuplicateSelectedShape}
@@ -2592,7 +2653,7 @@ export default function Capture() {
               </button>
               <button
                 type="button"
-                className="rounded-md border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
+                className="rounded-xl border border-red-200 bg-white px-3 py-2 text-xs font-medium text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={isActionPending}
                 onMouseDown={stopToolbarPointerEvent}
                 onClick={handleDeleteSelectedShape}
@@ -2601,18 +2662,18 @@ export default function Capture() {
               </button>
             </>
           )}
-          <div className="w-px h-5 bg-zinc-300 mx-1" />
-          <button type="button" className="rounded p-1.5 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50" disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={undo}><Undo2 size={18} /></button>
-          <button type="button" className="rounded p-1.5 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50" disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={redo}><Redo2 size={18} /></button>
-          <div className="w-px h-5 bg-zinc-300 mx-1" />
-          <button type="button" className="rounded p-1.5 text-blue-600 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50" disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => handleExport('copy')}><Copy size={18} /></button>
-          <button type="button" className="rounded p-1.5 text-green-600 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50" disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => handleExport('save')}><Download size={18} /></button>
-          <button type="button" className="rounded p-1.5 text-amber-600 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50" disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => void handlePin()}><PinIcon size={18} /></button>
-          <button type="button" className="rounded p-1.5 text-purple-600 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50" disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={handleOCR}><ScanText size={18} /></button>
+          <div className="mx-1 h-6 w-px bg-zinc-200" />
+          <button type="button" className={actionIconButtonClass('neutral')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={undo}><Undo2 size={18} /></button>
+          <button type="button" className={actionIconButtonClass('neutral')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={redo}><Redo2 size={18} /></button>
+          <div className="mx-1 h-6 w-px bg-zinc-200" />
+          <button type="button" className={actionIconButtonClass('blue')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => handleExport('copy')}><Copy size={18} /></button>
+          <button type="button" className={actionIconButtonClass('green')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => handleExport('save')}><Download size={18} /></button>
+          <button type="button" className={actionIconButtonClass('amber')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={() => void handlePin()}><PinIcon size={18} /></button>
+          <button type="button" className={actionIconButtonClass('purple')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={handleOCR}><ScanText size={18} /></button>
           {lastExportedFilePath && (
             <button
               type="button"
-              className="rounded-md border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:border-zinc-300 hover:bg-zinc-50"
+              className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs font-medium text-zinc-700 hover:border-zinc-300 hover:bg-zinc-50"
               disabled={isActionPending}
               onMouseDown={stopToolbarPointerEvent}
               onClick={() => void handleRevealFile(lastExportedFilePath)}
@@ -2620,9 +2681,9 @@ export default function Capture() {
               显示文件
             </button>
           )}
-          <div className="w-px h-5 bg-zinc-300 mx-1" />
-          <button type="button" className="rounded p-1.5 text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50" disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={resetSelectionForReselect}><X size={18} /></button>
-          <button type="button" className="rounded p-1.5 text-green-600 hover:bg-green-50 disabled:cursor-not-allowed disabled:opacity-50" disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={handleCloseCapture}><Check size={18} /></button>
+          <div className="mx-1 h-6 w-px bg-zinc-200" />
+          <button type="button" className={actionIconButtonClass('red')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={handleCancelCapture}><X size={18} /></button>
+          <button type="button" className={actionIconButtonClass('green')} disabled={isActionPending} onMouseDown={stopToolbarPointerEvent} onClick={handleCloseCapture}><Check size={18} /></button>
         </div>
       )}
     </div>

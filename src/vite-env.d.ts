@@ -13,6 +13,12 @@ interface Window {
       closeAfterCopy: boolean;
       closeAfterSave: boolean;
       closeAfterPin: boolean;
+      historyLimit: number;
+      annotationColor: string;
+      annotationStrokeWidth: number;
+      annotationFontSize: number;
+      toolbarOpacity: number;
+      toolbarScale: number;
       ocrLanguages: 'eng' | 'chi_sim' | 'eng+chi_sim';
       pinWindowShadow: boolean;
       pinWindowOpacity: number;
@@ -28,6 +34,12 @@ interface Window {
       closeAfterCopy: boolean;
       closeAfterSave: boolean;
       closeAfterPin: boolean;
+      historyLimit: number;
+      annotationColor: string;
+      annotationStrokeWidth: number;
+      annotationFontSize: number;
+      toolbarOpacity: number;
+      toolbarScale: number;
       ocrLanguages: 'eng' | 'chi_sim' | 'eng+chi_sim';
       pinWindowShadow: boolean;
       pinWindowOpacity: number;
@@ -43,6 +55,12 @@ interface Window {
         closeAfterCopy: boolean;
         closeAfterSave: boolean;
         closeAfterPin: boolean;
+        historyLimit: number;
+        annotationColor: string;
+        annotationStrokeWidth: number;
+        annotationFontSize: number;
+        toolbarOpacity: number;
+        toolbarScale: number;
         ocrLanguages: 'eng' | 'chi_sim' | 'eng+chi_sim';
         pinWindowShadow: boolean;
         pinWindowOpacity: number;
@@ -72,15 +90,16 @@ interface Window {
     >;
     recordCaptureHistory: (payload: {
       dataURL: string;
-      action: 'copy' | 'save' | 'pin';
+      action: 'copy' | 'save' | 'pin' | 'confirm';
       format: 'png' | 'jpg';
     }) => Promise<
       | { status: 'success'; item: {
         id: string;
         filePath: string;
         thumbnailPath: string;
+        thumbnailDataURL: string;
         createdAt: number;
-        action: 'copy' | 'save' | 'pin';
+        action: 'copy' | 'save' | 'pin' | 'confirm';
         format: 'png' | 'jpg';
         width: number;
         height: number;
@@ -91,14 +110,19 @@ interface Window {
       id: string;
       filePath: string;
       thumbnailPath: string;
+      thumbnailDataURL: string;
       createdAt: number;
-      action: 'copy' | 'save' | 'pin';
+      action: 'copy' | 'save' | 'pin' | 'confirm';
       format: 'png' | 'jpg';
       width: number;
       height: number;
     }>>;
     deleteCaptureHistory: (id: string) => Promise<
       | { status: 'success'; message?: undefined }
+      | { status: 'error'; message?: string }
+    >;
+    clearCaptureHistory: () => Promise<
+      | { status: 'success' }
       | { status: 'error'; message?: string }
     >;
     copyHistoryImage: (id: string) => Promise<
@@ -117,6 +141,18 @@ interface Window {
       | { status: 'success' }
       | { status: 'error'; message: string }
     >;
+    resizeCurrentWindow: (payload: { width: number; height: number }) => Promise<
+      | { status: 'success' }
+      | { status: 'error'; message: string }
+    >;
+    setCurrentWindowBounds: (payload: { x: number; y: number; width: number; height: number }) => Promise<
+      | { status: 'success' }
+      | { status: 'error'; message: string }
+    >;
+    moveCurrentWindow: (payload: { x: number; y: number }) => Promise<
+      | { status: 'success' }
+      | { status: 'error'; message: string }
+    >;
     closeCurrentWindow: () => Promise<{ status: 'success' }>;
     translateText: (payload: {
       text: string;
@@ -130,5 +166,6 @@ interface Window {
     updateSelectionState: (hasSelection: boolean) => void;
     clearOtherSelections: () => void;
     onClearSelection: (callback: () => void) => void;
+    onCancelCaptureRequest: (callback: () => void) => void;
   };
 }

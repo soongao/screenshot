@@ -11,7 +11,6 @@ let mainWindow = null;
 let captureWindows = [];
 let pinWindows = [];
 let activeSelectionWebContentsId = null;
-let hasAnySelection = false;
 const execFileAsync = promisify(execFile);
 const DEFAULT_APP_SETTINGS = {
   startCapture: "CommandOrControl+Shift+A",
@@ -24,6 +23,12 @@ const DEFAULT_APP_SETTINGS = {
   closeAfterCopy: true,
   closeAfterSave: false,
   closeAfterPin: true,
+  historyLimit: 5,
+  annotationColor: "#ff3b30",
+  annotationStrokeWidth: 4,
+  annotationFontSize: 20,
+  toolbarOpacity: 0.94,
+  toolbarScale: 1,
   ocrLanguages: "eng+chi_sim",
   pinWindowShadow: true,
   pinWindowOpacity: 1
@@ -64,7 +69,6 @@ async function tryMyMemoryEndpoint(payload) {
 }
 function resetCaptureSessionState() {
   activeSelectionWebContentsId = null;
-  hasAnySelection = false;
 }
 function getShortcutSettingsPath() {
   return path.join(app.getPath("userData"), "shortcut-settings.json");
@@ -116,6 +120,12 @@ function normalizeAppSettings(nextSettings) {
     closeAfterCopy: Boolean(nextSettings.closeAfterCopy),
     closeAfterSave: Boolean(nextSettings.closeAfterSave),
     closeAfterPin: Boolean(nextSettings.closeAfterPin),
+    historyLimit: Math.min(200, Math.max(1, Number(nextSettings.historyLimit) || 5)),
+    annotationColor: /^#([0-9a-fA-F]{6})$/.test(nextSettings.annotationColor) ? nextSettings.annotationColor : "#ff3b30",
+    annotationStrokeWidth: [2, 4, 6, 8, 12].includes(Number(nextSettings.annotationStrokeWidth)) ? Number(nextSettings.annotationStrokeWidth) : 4,
+    annotationFontSize: [14, 18, 20, 24, 28, 32].includes(Number(nextSettings.annotationFontSize)) ? Number(nextSettings.annotationFontSize) : 20,
+    toolbarOpacity: Math.min(1, Math.max(0.7, Number(nextSettings.toolbarOpacity) || 0.94)),
+    toolbarScale: [0.9, 1, 1.1, 1.2].includes(Number(nextSettings.toolbarScale)) ? Number(nextSettings.toolbarScale) : 1,
     ocrLanguages: nextSettings.ocrLanguages === "eng" || nextSettings.ocrLanguages === "chi_sim" ? nextSettings.ocrLanguages : "eng+chi_sim",
     pinWindowShadow: Boolean(nextSettings.pinWindowShadow),
     pinWindowOpacity: Math.min(1, Math.max(0.2, Number(nextSettings.pinWindowOpacity) || 1))
@@ -124,18 +134,11 @@ function normalizeAppSettings(nextSettings) {
 function syncSelectionState(senderId, hasSelection) {
   if (hasSelection) {
     activeSelectionWebContentsId = senderId;
-    hasAnySelection = true;
     return;
   }
   if (activeSelectionWebContentsId === senderId) {
     activeSelectionWebContentsId = null;
   }
-  hasAnySelection = captureWindows.some((win) => {
-    if (win.isDestroyed()) {
-      return false;
-    }
-    return win.webContents.id === activeSelectionWebContentsId;
-  });
 }
 function clearSelectionsExcept(sender) {
   captureWindows.forEach((win) => {
@@ -149,19 +152,20 @@ function clearSelectionsExcept(sender) {
   });
 }
 function handleEscPressed() {
-  if (!hasAnySelection || activeSelectionWebContentsId === null) {
+  const targetWebContentsId = activeSelectionWebContentsId;
+  if (targetWebContentsId === null) {
     closeCapture();
     return;
   }
   const activeWindow = captureWindows.find((win) => {
-    return !win.isDestroyed() && win.webContents.id === activeSelectionWebContentsId;
+    return !win.isDestroyed() && win.webContents.id === targetWebContentsId;
   });
   if (!activeWindow) {
     resetCaptureSessionState();
     closeCapture();
     return;
   }
-  activeWindow.webContents.send("capture-clear-selection");
+  activeWindow.webContents.send("capture-cancel-request");
 }
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -383,6 +387,29 @@ async function writeCaptureHistory(items) {
   await mkdir(path.dirname(historyPath), { recursive: true });
   await writeFile(historyPath, JSON.stringify(items, null, 2), "utf8");
 }
+async function trimCaptureHistoryToLimit(items, limit) {
+  const safeLimit = Math.min(200, Math.max(1, limit));
+  const keptItems = items.slice(0, safeLimit);
+  const removedItems = items.slice(safeLimit);
+  await Promise.allSettled(
+    removedItems.flatMap((item) => {
+      const deletions = [unlink(item.filePath)];
+      if (item.thumbnailPath !== item.filePath) {
+        deletions.push(unlink(item.thumbnailPath));
+      }
+      return deletions;
+    })
+  );
+  await writeCaptureHistory(keptItems);
+  return keptItems;
+}
+function toHistoryListItem(item) {
+  const thumbnailImage = nativeImage.createFromPath(item.thumbnailPath);
+  return {
+    ...item,
+    thumbnailDataURL: thumbnailImage.isEmpty() ? "" : thumbnailImage.toDataURL()
+  };
+}
 async function recordCaptureHistory(payload) {
   const image = nativeImage.createFromDataURL(payload.dataURL);
   if (image.isEmpty()) {
@@ -405,8 +432,8 @@ async function recordCaptureHistory(payload) {
     height: size.height
   };
   const current = await readCaptureHistory();
-  const next = [item, ...current].slice(0, 50);
-  await writeCaptureHistory(next);
+  const next = [item, ...current];
+  await trimCaptureHistoryToLimit(next, activeAppSettings.historyLimit);
   return item;
 }
 async function deleteCaptureHistoryItem(id) {
@@ -421,6 +448,19 @@ async function deleteCaptureHistoryItem(id) {
   ]);
   await writeCaptureHistory(current.filter((item) => item.id !== id));
   return true;
+}
+async function clearCaptureHistory() {
+  const current = await readCaptureHistory();
+  await Promise.allSettled(
+    current.flatMap((item) => {
+      const deletions = [unlink(item.filePath)];
+      if (item.thumbnailPath !== item.filePath) {
+        deletions.push(unlink(item.thumbnailPath));
+      }
+      return deletions;
+    })
+  );
+  await writeCaptureHistory([]);
 }
 function createPinWindow(dataURL) {
   const pinId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -551,6 +591,9 @@ app.whenReady().then(async () => {
       };
     }
     await writeShortcutSettingsToDisk(normalizedSettings);
+    activeAppSettings = { ...normalizedSettings };
+    const currentHistory = await readCaptureHistory();
+    await trimCaptureHistoryToLimit(currentHistory, normalizedSettings.historyLimit);
     return {
       status: "success",
       settings: normalizedSettings
@@ -625,11 +668,16 @@ app.whenReady().then(async () => {
     }
   });
   ipcMain.handle("list-capture-history", async () => {
-    return readCaptureHistory();
+    const items = await readCaptureHistory();
+    return items.map(toHistoryListItem);
   });
   ipcMain.handle("delete-capture-history", async (_event, id) => {
     const deleted = await deleteCaptureHistoryItem(id);
     return { status: deleted ? "success" : "error", message: deleted ? void 0 : "未找到对应的历史记录" };
+  });
+  ipcMain.handle("clear-capture-history", async () => {
+    await clearCaptureHistory();
+    return { status: "success" };
   });
   ipcMain.handle("copy-history-image", async (_event, id) => {
     const items = await readCaptureHistory();
@@ -666,6 +714,37 @@ app.whenReady().then(async () => {
       return { status: "error", message: "当前贴图窗口不可用" };
     }
     pinWindow.setOpacity(Math.min(1, Math.max(0.2, opacity)));
+    return { status: "success" };
+  });
+  ipcMain.handle("resize-current-window", (event, payload) => {
+    const currentWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!currentWindow) {
+      return { status: "error", message: "当前窗口不可用" };
+    }
+    const width = Math.max(160, Math.round(payload.width));
+    const height = Math.max(120, Math.round(payload.height));
+    currentWindow.setSize(width, height, false);
+    return { status: "success" };
+  });
+  ipcMain.handle("set-current-window-bounds", (event, payload) => {
+    const currentWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!currentWindow) {
+      return { status: "error", message: "当前窗口不可用" };
+    }
+    currentWindow.setBounds({
+      x: Math.round(payload.x),
+      y: Math.round(payload.y),
+      width: Math.max(160, Math.round(payload.width)),
+      height: Math.max(120, Math.round(payload.height))
+    }, false);
+    return { status: "success" };
+  });
+  ipcMain.handle("move-current-window", (event, payload) => {
+    const currentWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!currentWindow) {
+      return { status: "error", message: "当前窗口不可用" };
+    }
+    currentWindow.setPosition(Math.round(payload.x), Math.round(payload.y), false);
     return { status: "success" };
   });
   ipcMain.handle("close-current-window", (event) => {
@@ -714,7 +793,6 @@ app.whenReady().then(async () => {
   });
   ipcMain.on("capture-begin-selection", (event) => {
     activeSelectionWebContentsId = event.sender.id;
-    hasAnySelection = false;
     clearSelectionsExcept(event.sender);
   });
   ipcMain.on("capture-selection-state", (event, payload) => {
