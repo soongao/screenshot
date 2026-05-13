@@ -57,9 +57,9 @@ const CAPABILITY_LABELS = [
 ]
 
 const DEFAULT_SHORTCUT_SETTINGS: ShortcutSettings = {
-  startCapture: 'CommandOrControl+Shift+A',
-  startOcr: 'CommandOrControl+Shift+O',
-  startTranslate: 'CommandOrControl+Shift+T',
+  startCapture: 'CommandOrControl+Alt+A',
+  startOcr: 'CommandOrControl+Alt+O',
+  startTranslate: 'CommandOrControl+Alt+T',
   forceExit: 'CommandOrControl+Shift+Q',
   translationSourceLang: 'auto',
   translationTargetLang: 'zh',

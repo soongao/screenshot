@@ -1,4 +1,4 @@
-import { app, systemPreferences, ipcMain, desktopCapturer, screen, BrowserWindow, dialog, nativeImage, shell, clipboard, globalShortcut } from "electron";
+import { app, systemPreferences, ipcMain, desktopCapturer, screen, BrowserWindow, dialog, nativeImage, shell, clipboard, globalShortcut, Tray, Menu } from "electron";
 import { execFile } from "node:child_process";
 import { writeFile, mkdir, readFile, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -11,12 +11,23 @@ let mainWindow = null;
 let captureWindows = [];
 let pinWindows = [];
 let activeSelectionWebContentsId = null;
-const execFileAsync = promisify(execFile);
-const DEFAULT_APP_SETTINGS = {
+let tray = null;
+let isForceQuitting = false;
+const LEGACY_DEFAULT_SHORTCUTS = {
   startCapture: "CommandOrControl+Shift+A",
   startOcr: "CommandOrControl+Shift+O",
   startTranslate: "CommandOrControl+Shift+T",
-  forceExit: "CommandOrControl+Shift+Q",
+  forceExit: "CommandOrControl+Shift+Q"
+};
+const DEFAULT_SHORTCUT_SETTINGS = {
+  startCapture: "CommandOrControl+Alt+A",
+  startOcr: "CommandOrControl+Alt+O",
+  startTranslate: "CommandOrControl+Alt+T",
+  forceExit: "CommandOrControl+Shift+Q"
+};
+const execFileAsync = promisify(execFile);
+const DEFAULT_APP_SETTINGS = {
+  ...DEFAULT_SHORTCUT_SETTINGS,
   translationSourceLang: "auto",
   translationTargetLang: "zh",
   defaultExportFormat: "png",
@@ -35,6 +46,81 @@ const DEFAULT_APP_SETTINGS = {
 };
 let activeAppSettings = { ...DEFAULT_APP_SETTINGS };
 const pinWindowPayloads = /* @__PURE__ */ new Map();
+function createTrayImage() {
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20">
+      <rect x="3" y="4" width="14" height="11" rx="2.5" fill="#111827"/>
+      <rect x="5.25" y="6.25" width="9.5" height="6.5" rx="1.2" fill="none" stroke="#ffffff" stroke-width="1.5"/>
+      <circle cx="13.6" cy="7.9" r="0.95" fill="#ffffff"/>
+      <path d="M6.7 12.2l2.25-2.3 1.6 1.45 1.35-1.1 2.15 1.95" fill="none" stroke="#ffffff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.35"/>
+    </svg>
+  `.trim();
+  const image = nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`).resize({ width: 18, height: 18 });
+  if (process.platform === "darwin") {
+    image.setTemplateImage(true);
+  }
+  return image;
+}
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (process.platform === "darwin") {
+    app.dock.show();
+  }
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  mainWindow.show();
+  mainWindow.focus();
+}
+function hideMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+  mainWindow.hide();
+  if (process.platform === "darwin") {
+    app.dock.hide();
+  }
+}
+function createTray() {
+  if (tray) {
+    return;
+  }
+  tray = new Tray(createTrayImage());
+  tray.setToolTip(app.getName());
+  tray.setContextMenu(Menu.buildFromTemplate([
+    {
+      label: "显示主界面",
+      click: () => showMainWindow()
+    },
+    {
+      label: "开始截图",
+      click: () => startCapture("region")
+    },
+    {
+      label: "OCR 截图",
+      click: () => startCapture("region", "ocr")
+    },
+    {
+      label: "翻译截图",
+      click: () => startCapture("region", "translate")
+    },
+    { type: "separator" },
+    {
+      label: "退出应用",
+      click: () => forceExitApp()
+    }
+  ]));
+  tray.on("click", () => {
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
+      hideMainWindow();
+      return;
+    }
+    showMainWindow();
+  });
+}
 async function tryLibreTranslateEndpoint(url, payload) {
   var _a;
   const response = await fetch(url, {
@@ -79,10 +165,21 @@ async function readShortcutSettingsFromDisk() {
   try {
     const raw = await readFile(settingsPath, "utf8");
     const parsed = JSON.parse(raw);
-    return {
+    const mergedSettings = {
       ...DEFAULT_APP_SETTINGS,
       ...parsed
     };
+    const migratedSettings = {
+      ...mergedSettings,
+      startCapture: parsed.startCapture === LEGACY_DEFAULT_SHORTCUTS.startCapture ? DEFAULT_SHORTCUT_SETTINGS.startCapture : mergedSettings.startCapture,
+      startOcr: parsed.startOcr === LEGACY_DEFAULT_SHORTCUTS.startOcr ? DEFAULT_SHORTCUT_SETTINGS.startOcr : mergedSettings.startOcr,
+      startTranslate: parsed.startTranslate === LEGACY_DEFAULT_SHORTCUTS.startTranslate ? DEFAULT_SHORTCUT_SETTINGS.startTranslate : mergedSettings.startTranslate,
+      forceExit: parsed.forceExit === LEGACY_DEFAULT_SHORTCUTS.forceExit ? DEFAULT_SHORTCUT_SETTINGS.forceExit : mergedSettings.forceExit
+    };
+    if (JSON.stringify(migratedSettings) !== JSON.stringify(mergedSettings)) {
+      await writeFile(settingsPath, JSON.stringify(migratedSettings, null, 2), "utf8");
+    }
+    return migratedSettings;
   } catch {
     await writeFile(settingsPath, JSON.stringify(DEFAULT_APP_SETTINGS, null, 2), "utf8");
     return { ...DEFAULT_APP_SETTINGS };
@@ -168,7 +265,11 @@ function handleEscPressed() {
   activeWindow.webContents.send("capture-cancel-request");
 }
 function createWindow() {
-  mainWindow = new BrowserWindow({
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    showMainWindow();
+    return;
+  }
+  const nextWindow = new BrowserWindow({
     width: 800,
     height: 600,
     webPreferences: {
@@ -177,11 +278,27 @@ function createWindow() {
       contextIsolation: true
     }
   });
-  if (VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(VITE_DEV_SERVER_URL);
-  } else {
-    mainWindow.loadFile(path.join(process.env.APP_ROOT, "dist/index.html"));
+  mainWindow = nextWindow;
+  if (process.platform === "darwin") {
+    app.dock.show();
   }
+  if (VITE_DEV_SERVER_URL) {
+    nextWindow.loadURL(VITE_DEV_SERVER_URL);
+  } else {
+    nextWindow.loadFile(path.join(process.env.APP_ROOT, "dist/index.html"));
+  }
+  nextWindow.on("close", (event) => {
+    if (isForceQuitting) {
+      return;
+    }
+    event.preventDefault();
+    hideMainWindow();
+  });
+  nextWindow.on("closed", () => {
+    if (mainWindow === nextWindow) {
+      mainWindow = null;
+    }
+  });
 }
 async function getVisibleWindows() {
   const swiftScript = `
@@ -318,10 +435,13 @@ function closeCapture() {
   });
 }
 function forceExitApp() {
+  isForceQuitting = true;
   closeCapture();
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.destroy();
   }
+  tray == null ? void 0 : tray.destroy();
+  tray = null;
   app.exit(0);
 }
 function registerAppShortcuts(settings) {
@@ -510,6 +630,7 @@ app.whenReady().then(async () => {
       console.warn("[Capture] No screen capture permission. Please grant it in System Preferences -> Security & Privacy.");
     }
   }
+  createTray();
   createWindow();
   const persistedShortcutSettings = await readShortcutSettingsFromDisk();
   const registerResult = registerAppShortcuts(persistedShortcutSettings);
@@ -802,18 +923,19 @@ app.whenReady().then(async () => {
     clearSelectionsExcept(event.sender);
   });
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
+    showMainWindow();
   });
 });
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") {
+  if (isForceQuitting && process.platform !== "darwin") {
     app.quit();
   }
 });
 app.on("will-quit", () => {
   globalShortcut.unregisterAll();
+});
+app.on("before-quit", () => {
+  isForceQuitting = true;
 });
 export {
   VITE_DEV_SERVER_URL
